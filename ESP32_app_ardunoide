@@ -1,0 +1,94 @@
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+
+// Danh sách Wi-Fi
+const char* wifiList[][2] = {
+  {"TiNi FPT Wifi 6", "thuhuong181"},
+  {"WiFi2", "password2"},
+  {"WiFi3", "password3"}
+};
+const int wifiCount = sizeof(wifiList) / sizeof(wifiList[0]);
+
+// Thông tin Firebase
+#define FIREBASE_HOST "https://labln-fd4bb-default-rtdb.firebaseio.com/"
+#define FIREBASE_AUTH "Y8KzKL9jeB7mww0523sQ76xug5pKhdVZ5Bc2AhSd"
+
+// UART
+#define UART_BAUD_RATE 115200
+#define UART_RX_PIN 16  
+#define UART_TX_PIN 17 
+
+// Gói tin
+#define STX 0x02
+#define ETX 0x03
+
+FirebaseData firebaseData;
+FirebaseConfig firebaseConfig;
+FirebaseAuth firebaseAuth;
+
+bool receivingPacket = false;
+uint8_t payloadLen = 0, payloadBuffer[128], payloadIndex = 0, checksum = 0;
+unsigned long lastReceiveTime = 0;
+
+void connectToWiFi() {
+  for (int i = 0; i < wifiCount; i++) {
+    WiFi.disconnect();
+    WiFi.begin(wifiList[i][0], wifiList[i][1]);
+    for (int retry = 0; retry < 10 && WiFi.status() != WL_CONNECTED; retry++) delay(500);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Wi-Fi: " + String(wifiList[i][0]));
+      Serial.print("IP: "); Serial.println(WiFi.localIP());
+      return;
+    }
+  }
+  Serial.println("Không tìm thấy Wi-Fi khả dụng.");
+}
+//CHEK SUM KIEU NHU RADAR
+bool validateChecksum(uint8_t len, uint8_t *payload, uint8_t receivedChecksum) {
+  uint8_t calcChecksum = len;
+  for (uint8_t i = 0; i < len; i++) calcChecksum ^= payload[i];
+  return (~calcChecksum == receivedChecksum);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  connectToWiFi();
+  firebaseConfig.database_url = FIREBASE_HOST;
+  firebaseAuth.token = FIREBASE_AUTH;
+  Firebase.begin(&firebaseConfig, &firebaseAuth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  while (Serial2.available()) {
+    uint8_t byteReceived = Serial2.read();
+    lastReceiveTime = millis();
+
+    if (!receivingPacket && byteReceived == STX) {
+      receivingPacket = true; payloadIndex = 0;
+    } 
+    else if (receivingPacket) {
+      if (payloadIndex == 0) payloadLen = byteReceived, payloadIndex++;
+      else if (payloadIndex <= payloadLen) payloadBuffer[payloadIndex++ - 1] = byteReceived;
+      else if (payloadIndex == payloadLen + 1) checksum = byteReceived, payloadIndex++;
+      else if (payloadIndex == payloadLen + 2) {
+        if (byteReceived == ETX && validateChecksum(payloadLen, payloadBuffer, checksum)) {
+          String receivedData = "";
+          for (uint8_t i = 0; i < payloadLen; i++) receivedData += (char)payloadBuffer[i];
+          if (Firebase.pushString(firebaseData, "data", receivedData))
+            Serial.println("Đã gửi Firebase: " + receivedData);
+          else
+            Serial.println("Lỗi Firebase: " + firebaseData.errorReason());
+        }
+        receivingPacket = false;
+      }
+    }
+  }
+
+  if (receivingPacket && millis() - lastReceiveTime > 1000) {
+    receivingPacket = false;
+    Serial.println("Timeout gói tin.");
+  }
+}
